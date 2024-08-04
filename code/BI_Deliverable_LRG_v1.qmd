@@ -1,0 +1,1908 @@
+---
+title: "NSAID Cohort - Descriptive Analysis"
+author: "Lexi René Glatz"
+format: 
+  html:
+    code-fold: true
+    code-summary: "Show Code"
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup_packages_functions}
+#| echo: false
+#| include: false
+
+# packages
+if (!require('pacman')){ install.packages('pacman')}
+pacman::p_load(SqlRender, DatabaseConnector, liEunomia, 
+               dplyr, tidyr,
+               scales, ggplot, gtsummary, gt)
+## summary statistic wrapper for plot
+summary_stat <- function(x, column = NULL) {
+  
+        out_x <- tibble(
+          N = scales::number(length(x), big.mark = ','),
+          median_value = case_when(
+            is.na(median(x, na.rm = T)) ~ NA_character_,
+            T ~ scales::number(median(x, na.rm = T), 
+                               accuracy = .1, big.mark = ',')
+            ),
+          q25_value = case_when(
+            is.na(quantile(x, 0.25, na.rm = T)) ~ NA_character_,
+            T ~ scales::number(quantile(x, 0.25, na.rm = T), 
+                               accuracy = .1, big.mark = ',')
+            ),
+          q75_value = case_when(
+            is.na(quantile(x, 0.75, na.rm = T)) ~ NA_character_,
+            T ~ scales::number(quantile(x, 0.75, na.rm = T), 
+                               accuracy = .1, big.mark = ',')
+            ),
+          median_iqr = 
+            glue::glue('N = {N}, {median_value} ({q25_value} - {q75_value})')
+        ) %>%
+          select(median_iqr)
+  
+  return(out_x)
+}
+
+# sql wrappers
+## format text to ignore extra space btwn text
+sql_text <- function(sql_text_unformatted){
+  gsub('\\s+', ' ', sql_text_unformatted)
+}
+
+## run queries without needing to specify 
+## the connection on very sql call
+run_sql_query <- function(sql_query, db_conn_fn){
+  if(missing(db_conn_fn)){
+    if(!exists('connection')){
+      stop('must supply argument for db_conn_fxn')
+    } else{
+      db_conn_fn = connection
+    }
+  } 
+  
+  query_output <- DatabaseConnector::querySql(
+    connection = db_conn_fn, 
+    sql = sql_text(sql_query)
+    ) |>
+    tidyr::tibble() |> 
+    dplyr::rename_all(tolower)
+  
+  return(query_output)
+}
+
+
+my.max <- function(x) {
+  x1 <- ifelse( !all(is.na(x)), max(x, na.rm = T), NA)
+  if(class(x) == 'Date'){
+    x1 <- as.Date(x1)
+  }
+  return(x1)
+}
+
+EUNOMIA_DATA_FOLDER='/Users/rene/.Renviron/data'
+
+# set connection details for Eunomia
+connectionDetails <- Eunomia::getEunomiaConnectionDetails()
+# connect to Eunomia GiBleed
+connection <- DatabaseConnector::connect(connectionDetails)
+
+# Build GiBleed Cohorts
+Eunomia::createCohorts(connectionDetails = connectionDetails)
+
+```
+
+## Prompt
+
+Below is a description of the study population and characteristics that need to be assessed:
+
+Study Population: patients with NSAIDs (in the COHORT table, these are patients with Cohort Definition Id of 4)
+
+-   Summarize Cohort Characteristics
+    -   Demographics
+        -   Distribution of age in years
+        -   Gender
+    -   Conditions at Baseline
+    -   Drug Use at Baseline
+    -   Outcomes post-index
+        -   An outcome typically considered when studying NSAIDs is:
+            -   GI Bleed post-index
+            -   Gastrointestinal hemorrhage (Condition Concept Id 192671)
+
+## SQL & R Code
+
+```{r demographics}
+#| code-summary: "Click to view the demographics code"
+# Distribution of age in years 
+# Gender
+## concept_id 8507 == 'M', 8532 == 'F'
+demo_df <- run_sql_query('
+              select 
+                a.subject_id, 
+                b.year_of_birth as birth_yr,
+                b.gender_source_value as sex
+                from cohort as a
+              left join(
+                select person_id, year_of_birth,
+                  gender_source_value
+                  from person
+              ) as b on a.subject_id = b.person_id
+              where a.cohort_definition_id = 4
+              ') 
+
+
+```
+
+```{r comorbidities}
+#| code-summary: "Click to view the comorbidity code"
+
+## chronic conditions
+condition_era_df <- run_sql_query('
+select 
+  a.subject_id, a.cohort_start_date,
+  b.*,
+  con.concept_name as condition_name
+from cohort as a
+left join( 
+  select 
+    person_id, condition_concept_id, 
+    condition_era_start_date as condition_start_date, 
+    condition_era_end_date 
+  from condition_era
+  where condition_concept_id != 0
+) as b on a.subject_id = b.person_id
+left join(
+  select 
+    concept_id, concept_name
+  from concept
+) as con on b.condition_concept_id = con.concept_id
+where 
+  a.cohort_definition_id = 4 and
+  b.condition_start_date <= a.cohort_start_date and 
+  (b.condition_era_end_date  >= a.cohort_start_date or 
+    b.condition_era_end_date  is null)
+') |>
+  select(-person_id)
+
+## higher level information on conditions (including acute)
+condition_occurrence_df <- run_sql_query("
+select 
+  a.subject_id, a.cohort_start_date,
+  b.*,
+  con.concept_name as condition_name
+from cohort as a
+left join( 
+  select
+    person_id, condition_concept_id, 
+    condition_start_date, condition_end_date
+  from condition_occurrence
+  where condition_concept_id != 0
+) as b on a.subject_id = b.person_id
+left join(
+  select 
+    concept_id, concept_name
+  from concept
+) as con on b.condition_concept_id = con.concept_id
+where 
+  a.cohort_definition_id = 4 and
+  b.condition_start_date <= a.cohort_start_date and 
+  (b.condition_end_date >= a.cohort_start_date or b.condition_end_date is null)
+") |>
+  select(-person_id)
+
+## combine both conditon tables
+## 1. track where the data comes from
+## 2. track where the end date comes from
+## 3. if there are duplicate rows per subject that have the same conditon_concept_id, assign the matching end_date if one exists
+## 4. create identifiers for top conditions (with dates & prior history)
+## 5. get data to patient level
+baseline_condition_df <- condition_occurrence_df %>% 
+  mutate(db_occ = T) %>%
+  bind_rows(condition_era_df %>% 
+              mutate(db_era = T)
+            ) %>%
+  mutate(
+    db_end_date = case_when(
+      is.na(condition_end_date) & 
+        !is.na(condition_era_end_date) ~ 'era',
+      !is.na(condition_end_date) & 
+        is.na(condition_era_end_date) ~ 'occ',
+      condition_end_date == condition_era_end_date ~ 'both',
+      T ~ NA_character_
+    ) ,
+    end_date = case_when(
+      db_end_date == 'both' ~ condition_end_date,
+      db_end_date == 'era' ~ condition_era_end_date,
+      db_end_date == 'occ' ~ condition_end_date
+    ),
+    condition_duration = 
+           end_date - condition_start_date,
+    top_condition = case_when(
+           db_end_date != 'both' ~ T,
+           T ~ F
+           )
+  ) %>%
+  ## if there are duplicate rows per subject that have 
+  ## the same conditon_concept_id, assign the 
+  ## matching end_date if one exists
+  group_by(subject_id, condition_concept_id) %>%
+  mutate(
+    db_occ = any(db_occ),
+    db_era = any(db_era),
+    condition_end_date = my.max(condition_end_date),
+    condition_era_end_date = my.max(condition_era_end_date),
+    data_source = case_when(
+      any(db_occ == T) & any(db_era == T) ~ 'both',
+      any(db_occ == T) & any(is.na(db_era)) ~ 'occ',
+      any(is.na(db_occ)) & any(db_era == T) ~ 'era',
+      T ~ 'check'
+    )
+  ) %>%
+  ungroup() %>% 
+  ## remove duplicate records from the union/merge
+  distinct(subject_id, condition_concept_id,
+           condition_start_date, condition_end_date,
+           data_source, db_end_date, .keep_all = T) %>%
+  select(-c(condition_end_date, condition_era_end_date, 
+            db_occ, db_era)) %>%
+  ## create identifiers per patient for top conditions 
+  ## (with dates & prior history)
+  group_by(subject_id) %>%
+  mutate(
+    osteoarthritis = any(case_when(
+      condition_name == 'Osteoarthritis' ~ T,
+      T ~ F 
+    )),
+    diverticular_disease = any(case_when(
+      condition_name == 'Diverticular disease' ~ T,
+      T ~ F 
+    )),
+    history_cardiac_arrest = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Cardiac arrest' ~ T, 
+      T ~ F
+    )),
+    history_peptic_ulcer = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Peptic ulcer' ~ T, 
+      T ~ F
+    )),
+    history_ulcerative_colitis = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Ulcerative colitis' ~ T, 
+      T ~ F
+    )),
+    history_angiodysplasia = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Angiodysplasia of stomach' ~ T, 
+      T ~ F
+    )),
+    history_esophagitis = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Esophagitis' ~ T, 
+      T ~ F
+    )),
+    history_colon_polyp = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Polyp of colon' ~ T, 
+      T ~ F
+    )),
+    history_rheum_arthritis = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Rheumatoid arthritis' ~ T, 
+      T ~ F
+    )),
+     history_heart_attack = any(case_when(
+      (condition_start_date < cohort_start_date) & 
+        condition_name == 'Myocardial infarction' ~ T, 
+      T ~ F
+    )) ,
+    history_peptic_only = case_when(
+      history_peptic_ulcer == T &
+        history_colon_polyp == F &
+        history_esophagitis == F & 
+        history_angiodysplasia == F &
+        history_ulcerative_colitis == F ~ T,
+      T ~ F
+    )
+    ## everyone that had ulcerative colitis 
+    ## also had a history of peptic ulcer
+  ) %>%
+  ungroup() %>%
+  group_by(subject_id, data_source) %>%
+  mutate(
+    n_condition = case_when(
+      !is.na(end_date) ~ n(),
+      T ~ n()
+      )
+  ) %>%
+  ungroup() %>%
+  ## drop rows where end date is missing as these
+  ## are patients with prior history and we've already
+  ## idenitfied their conditions above
+  filter(!is.na(db_end_date)) %>%
+  arrange(subject_id, condition_start_date) %>%
+  ## track any and all top conditions per patient
+  group_by(subject_id) %>%
+  mutate(
+    any_other_condition = any(case_when(
+      !grepl('Osteoarthritis|Diverticular disease',
+             condition_name)  ~ T,
+      T ~ F
+    )),
+    osteo_only = all(case_when(
+      grepl('Osteoarthritis', condition_name)  ~ T,
+      T ~ F
+    )),
+    ## grouping patients by type of condition
+    condition_label = case_when(
+      diverticular_disease == T & 
+        any_other_condition == T ~ 
+        'Diverticular Disease & Other',
+      diverticular_disease == T & 
+        any_other_condition == F ~ 
+        'Diverticular Disease Only',
+      diverticular_disease == F & 
+        any_other_condition == T ~ 'Other Only',
+      diverticular_disease == F & 
+        any_other_condition == F ~ 'Osteoarthritis Only',
+       T ~ NA_character_
+      ),
+    ## storing important dates, may be useful
+    ## df long -> wide
+     osteoarthritis_start_date = my.max(case_when(
+      grepl('Osteoarthritis', condition_name) ~
+        condition_start_date,
+      T ~ NA
+    )),
+    diverticular_disease_start_date = my.max(case_when(
+      grepl('Diverticular', condition_name) ~ 
+        condition_start_date,
+      T ~ NA
+    )),
+    osteoarthritis_end_date = my.max(case_when(
+      grepl('Osteoarthritis', condition_name)  ~ end_date,
+      T ~ NA
+    )),
+    diverticular_disease_end_date = my.max(case_when(
+      grepl('Diverticular', condition_name) ~ end_date,
+      T ~ NA
+    )),
+    ## identifying patients that have more than 1 "other" condition
+    ## tracking their dates to store for a wide df
+    temp_cond_rank = case_when(
+      grepl('Other', condition_label) & 
+        !grepl('Osteo|Div', condition_name) ~ 
+        dense_rank(condition_start_date),
+      T ~ NA
+    ),
+    other_cond1_start_date = my.max(case_when(
+      temp_cond_rank == 1 ~  condition_start_date,
+      T ~ NA)) ,
+     other_cond1_end_date = my.max(case_when(
+      temp_cond_rank == 1 ~  end_date,
+      T ~ NA)) ,
+    other_cond2_start_date = my.max(case_when(
+      temp_cond_rank == 2 ~  condition_start_date,
+      T ~ NA) ),
+    other_cond2_end_date = my.max(case_when(
+      temp_cond_rank == 2 ~  end_date,
+      T ~ NA)) 
+  ) %>%
+  ungroup() %>% 
+  ## "duration" of condition, mostly for other conditions
+  ## main conditions are chronic
+  mutate(
+    duration_osteo = osteoarthritis_end_date -
+      osteoarthritis_start_date,
+    duration_diver_disease = diverticular_disease_end_date -
+      diverticular_disease_start_date,
+    duration_other_cond1 = other_cond1_end_date - 
+      other_cond1_start_date,
+    duration_other_cond2 = other_cond2_end_date - 
+      other_cond2_start_date,
+    n_conditions_dated = case_when(
+      !is.na(diverticular_disease_start_date) &
+        !is.na(other_cond1_start_date) &
+        !is.na(other_cond2_start_date) ~ 4,
+      !is.na(diverticular_disease_start_date) &
+        (!is.na(other_cond1_start_date) |
+        !is.na(other_cond2_start_date)) ~ 3,
+      !is.na(diverticular_disease_start_date) ~ 2,
+      T ~ 1
+    ),
+    ## relabeling grouping of conditions for tables
+    Osteoarthritis = factor(case_when(
+          condition_label == 'Osteoarthritis Only' ~
+            'O Only',
+          condition_label == 'Diverticular Disease Only' ~
+            'O + Diverticular Disease',
+          condition_label == 'Diverticular Disease & Other' ~
+            'O + Diverticular Disease + Other Conditions',
+          condition_label == 'Other Only' ~
+            'O + Other Conditions',
+          ),
+          level = c(
+            'O Only', 
+            'O + Diverticular Disease',
+            'O + Diverticular Disease + Other Conditions',
+            
+            'O + Other Conditions'
+          )
+      )
+  ) %>%
+  select(-c(db_end_date, temp_cond_rank) ) %>%
+  distinct() 
+
+## df long -> wide
+## patient level baseline conditions
+baseline_condition_pt_lvl_df <- baseline_condition_df %>%
+  select(-c(condition_concept_id, condition_start_date,
+            condition_name, end_date,
+            condition_duration)) %>%
+  distinct()
+
+
+```
+
+```{r drugs}
+#| code-summary: "Click to view the drugs code"
+
+## sql code for complete data extraction
+## stacking the drugs information from both the
+## era tables and the occurrence tables
+## restricting the dates of the drugs to overlap
+## the cohort_start_date
+## tracking which data table the data comes from
+## removing high detail information from drug name
+## so that drug names align between the two tables
+baseline_drugs_ai <- run_sql_query("
+  with drug_exp_baseline as (
+    select distinct
+        c.subject_id,
+        c.cohort_start_date,
+        de.drug_concept_id,
+        de.drug_exposure_start_date as drug_start_date,
+        de.drug_exposure_end_date as drug_end_date,
+        con.concept_name as drug_name,
+        1 as db_exp,
+        0 as db_era
+    from
+        cohort as c
+    left join drug_exposure as de on c.subject_id = de.person_id
+        and de.drug_exposure_start_date <= c.cohort_start_date
+        and (de.drug_exposure_end_date >= c.cohort_start_date or
+          de.drug_exposure_end_date is null)
+    left join concept as con on 
+      de.drug_concept_id = con.concept_id
+    where
+      c.cohort_definition_id = 4 and de.drug_concept_id != 0
+),
+
+drug_era_baseline as (
+    select distinct
+        c.subject_id,
+        c.cohort_start_date,
+        de.drug_concept_id,
+        de.drug_era_start_date as drug_start_date,
+        de.drug_era_end_date as drug_end_date,
+        con.concept_name as drug_name,
+        0 AS db_exp,
+        1 AS db_era
+    from
+        cohort as c
+    left join drug_era as de on c.subject_id = de.person_id and
+        de.drug_era_start_date <= c.cohort_start_date and
+        (de.drug_era_end_date >= c.cohort_start_date or 
+          de.drug_era_end_date is null)
+    left join concept as con on 
+      de.drug_concept_id = con.concept_id
+    where
+        c.cohort_definition_id = 4 and de.drug_concept_id != 0
+),
+
+combined_drugs as (
+    select * from drug_exp_baseline
+    union all
+    select * from drug_era_baseline
+),
+
+lower_dn as (
+    select distinct lower(drug_name) as lower_drug_name
+    from combined_drugs
+    where drug_name not like '% %'
+    order by lower_drug_name
+)
+
+select distinct
+    cd.subject_id,
+    cd.cohort_start_date,
+    cd.drug_concept_id,
+    cd.drug_start_date,
+    cd.drug_end_date,
+    cd.drug_name,
+    case 
+        when max(cd.db_exp) = 1 and 
+          max(cd.db_era) = 1 then 'both'
+        when max(cd.db_exp) = 1 then 'exp'
+        when max(cd.db_era) = 1 then 'era'
+        else 'check'
+    end as data_source,
+    coalesce (
+        (select lower_drug_name from lower_dn 
+         where LOWER(cd.drug_name) LIKE '%' || 
+         lower_drug_name || '%'
+         limit 1),
+        lower(cd.drug_name)
+    ) as overall_drug_name
+from 
+    combined_drugs cd
+group by 
+    cd.subject_id, cd.drug_concept_id, cd.drug_start_date
+order by 
+    cd.subject_id, cd.drug_start_date") 
+  
+  
+## updating the dataframe to include drug groupings
+## keep track of known NSAIDs, type of drugs, and "duration"
+## prep data from long -> wide conversion (want patient level)
+baseline_drugs_ai <- baseline_drugs_ai %>%
+  ## grouping drug type into NSAID, Immunosuppressant, Other
+  ## identifying NSAID drug
+    mutate(
+      overall_drug_type = case_when(
+        grepl('celecoxib|diclofenac|ibuprofen|naproxen', 
+               overall_drug_name) ~ 'NSAID',
+        grepl('cyclosporine|hydrocortisone|methotrexate', 
+               overall_drug_name) ~ 'Immunosuppresant',
+        T ~ 'Other'
+      ),
+      NSAID_drug = case_when(
+          grepl('celecoxib|diclofenac|ibuprofen|naproxen', 
+               overall_drug_name) ~ T,
+         T ~ F
+      ),
+      diff_drug_date = drug_end_date - drug_start_date
+    ) %>% 
+  ## dropping duplicate records from the union
+  distinct(subject_id, drug_start_date, drug_end_date,
+           overall_drug_name, .keep_all = T) %>%
+  ## getting df from long -> wide 
+  ## per patient, count the number of drug types, combinations, 
+  ## track dates of use
+  group_by(subject_id) %>%
+  mutate(
+    all_NSAID = all(NSAID_drug),
+    any_immuno = any(grepl('hydro|cyclo|metho', 
+                           overall_drug_name)),
+    any_other = any(grepl('clopid|carba|amox|aceta|nitro|nore',
+                           overall_drug_name)),
+    n_NSAID = sum(NSAID_drug),
+    any_nsaid_cele = any(grepl('celecoxib',
+                           overall_drug_name)),
+    any_nsaid_dicl = any(grepl('diclofenac',
+                           overall_drug_name)),
+    
+    both_nsaid_dicl_napr = 
+      any(grepl('diclofenac',
+                overall_drug_name)) &
+      any(grepl('naproxen',overall_drug_name)),
+    
+    both_nsaid_cele_napr = 
+      any(grepl('celecoxib',
+                overall_drug_name)) &
+      any(grepl('naproxen',
+                overall_drug_name)),
+    
+    both_nsaid_cele_ibup = 
+      any(grepl('celecoxib',
+                overall_drug_name)) &
+      any(grepl('ibuprofen',
+                overall_drug_name)),
+    
+    any_nsaid_napr = any(grepl('naproxen',
+                           overall_drug_name)),
+    any_nsaid_ibup = any(grepl('ibuprofen',
+                           overall_drug_name)),
+    nsaid_naproxen_start_date = my.max(case_when(
+      overall_drug_name == 'naproxen' ~ drug_start_date,
+      T ~ NA
+      )),
+    nsaid_diclofenac_start_date = my.max(case_when(
+      overall_drug_name == 'diclofenac' ~ drug_start_date,
+      T ~ NA
+      )),
+    nsaid_ibuprofen_start_date = my.max(case_when(
+      overall_drug_name == 'ibuprofen' ~ drug_start_date,
+      T ~ NA
+      )),
+    nsaid_celecoxib_start_date = my.max(case_when(
+      overall_drug_name == 'celecoxib' ~ drug_start_date,
+      T ~ NA
+      )),
+    nsaid_naproxen_end_date = my.max(case_when(
+      overall_drug_name == 'naproxen' ~ drug_end_date,
+      T ~ NA
+      )),
+    nsaid_ibuprofen_end_date = my.max(case_when(
+      overall_drug_name == 'ibuprofen' ~ drug_end_date,
+      T ~ NA
+      )),
+    nsaid_duration_ibuprofen = 
+      nsaid_ibuprofen_end_date - nsaid_ibuprofen_start_date,
+    nsaid_duration_naproxen = 
+      nsaid_naproxen_end_date - nsaid_naproxen_start_date,
+  ) %>%
+  ungroup() %>%
+  select(-c(nsaid_ibuprofen_end_date, nsaid_naproxen_end_date))
+
+## patient level data for drugs
+## creating a tracker for the combination of nsaids received 
+baseline_drugs_ai_pt_lvl <- baseline_drugs_ai %>%
+  select(-c(
+    drug_concept_id, drug_start_date, drug_end_date,
+    data_source, overall_drug_name, overall_drug_type,
+    diff_drug_date, drug_name, NSAID_drug
+  )) %>%
+  distinct() %>%
+  mutate(
+     nsaid_drug_type = stringr::str_to_title(case_when(
+      !is.na(nsaid_celecoxib_start_date) &
+      !is.na(nsaid_naproxen_start_date) ~ 
+        'celecoxib & naproxen',
+      !is.na(nsaid_celecoxib_start_date) &
+        !is.na(nsaid_ibuprofen_start_date) ~ 
+        'celecoxib & ibuprofen',
+      !is.na(nsaid_diclofenac_start_date) &
+        !is.na(nsaid_naproxen_start_date) ~ 
+        'diclofenac & naproxen',
+      !is.na(nsaid_naproxen_start_date) ~ 'naproxen',
+      !is.na(nsaid_ibuprofen_start_date) ~ 'ibuprofen',
+      !is.na(nsaid_diclofenac_start_date) ~ 'diclofenac',
+      !is.na(nsaid_celecoxib_start_date) ~ 'celecoxib',
+      T ~ NA_character_
+    ))  
+    )
+
+## acetaminophen - non-opioid analgesic and antipyretic 
+### not a NSAID does not have anti-inflammatory effect (Tylenol)
+## amoxicillin - antibiotic
+## carbamazepine - anticonvulsant
+## celecoxib - NSAID 
+## clopidogrel - antiplatelet
+## cyclosporine - imunnosuppresant
+## diclofenac - NSAID (voltaren)
+## hydrocortisone - immunosuppresant
+## ibuprofen - NSAID (motrin)
+## methotrexate - immunosuppresant
+## naproxen - NSAID (aleve)
+## nitroglycerin - treats angina (chest pain)
+## norethindrone - progesterone hormone
+# baseline_drugs_ai_pt_lvl %>% 
+#   count(all_NSAID, any_other, any_immuno)
+
+
+```
+
+```{r outcomes}
+#| code-summary: "Click to view the outcomes code"
+
+## sql code for identifying outcomes post index (cohort start) 
+## for the cohort defined
+## r code to create two bins for gi bleed (14, 30) days
+## retain only those with bleeds and 
+## the start date of the bleed
+outcomes_post_index <- run_sql_query("
+  select 
+    b.*, 
+    a.condition_start_date as gi_bleed_start_date,
+    a.condition_concept_id
+  from condition_occurrence as a
+  left join(
+    select 
+      subject_id, cohort_start_date
+    from cohort 
+    where cohort_definition_id = 4
+  ) as b on b.subject_id = a.person_id
+  where 
+    condition_concept_id in (
+      select concept_id
+      from concept 
+      where concept_id like '192671') and
+    person_id in (
+      select 
+        subject_id
+      from cohort 
+      where cohort_definition_id = 4 
+    )") %>%
+  mutate(
+    gi_bleed_30day = case_when(
+      gi_bleed_start_date > cohort_start_date &
+        gi_bleed_start_date <= cohort_start_date + 30 ~ T,
+      T ~ F
+    ),
+    gi_bleed_14day = case_when(
+      gi_bleed_start_date > cohort_start_date &
+        gi_bleed_start_date <= cohort_start_date + 14 ~ T,
+      T ~ F
+    )
+  ) %>%
+  filter(
+    gi_bleed_14day == T | gi_bleed_30day == T
+  )
+
+## no one has more than one bleed
+
+```
+
+```{r final_patient_level}
+#| code-summary: "Click to view the patient level code"
+
+## combine all patient level data
+## merging demographic, conditions, drugs, and outcomes
+## find age at index and create age categories
+final_baseline_df <- demo_df %>% 
+  left_join(
+    outcomes_post_index %>% 
+      select(-c(condition_concept_id, 
+                cohort_start_date)),
+    by = 'subject_id'
+  ) %>%
+  left_join(
+    baseline_condition_pt_lvl_df ,
+    by = c('subject_id')
+  ) %>%
+  left_join(
+    baseline_drugs_ai_pt_lvl,
+    by = c('subject_id', 'cohort_start_date')
+  ) %>%
+  mutate(
+    across(c(gi_bleed_14day, gi_bleed_30day), 
+           ~if_else(. == T, T , F, F)),
+    age_at_baseline = 
+      lubridate::year(cohort_start_date) - birth_yr,
+    age_cat = factor(case_when(
+      age_at_baseline < 35 ~ '<35',
+      between(age_at_baseline, 35, 39) ~ '35-39',
+      between(age_at_baseline, 40, 44) ~ '40-44',
+      age_at_baseline >= 45 ~ '45+',
+      T ~ NA_character_
+    ),
+    levels = c('<35', '35-39','40-44','45+')
+    )
+  )
+
+
+
+## get unique counts for condition types and drug types
+## will use in table creation
+n_ct <- final_baseline_df %>% 
+  count(condition_label) %>%
+  add_row(
+    condition_label = 'Osteo',
+    n = nrow(final_baseline_df)
+  ) %>% 
+  mutate(n_txt = scales::number(n, big.mark = ',')) %>%
+  rename(label = condition_label )
+
+n_drug_ct <- baseline_drugs_ai %>% 
+  group_by(overall_drug_type) %>% 
+  count(subject_id) %>% 
+  ungroup() %>% 
+  count(overall_drug_type) %>%
+  mutate(n_txt = scales::number(n, big.mark = ',')) %>%
+  rename(label = overall_drug_type)
+
+
+
+
+
+```
+
+```{r tables}
+#| echo: false
+
+## gtsummary functions to create tables for the html
+## as many modifications will be made, code will not be 
+## included in HTML report
+
+
+## demographic table at baseline, 
+## includes history of prior conditions
+table1 <- final_baseline_df %>% 
+    select(sex, age_at_baseline, age_cat,
+           history_peptic_ulcer, 
+           history_colon_polyp,
+           history_esophagitis,
+           history_angiodysplasia,
+           history_ulcerative_colitis) %>% 
+    tbl_summary(
+        label = 
+            list( sex = 'Sex', 
+                  age_at_baseline ='Age', 
+                  age_cat ='Age categorized',
+                  history_peptic_ulcer = 
+          'Prior Peptic Ulcer',    
+        history_esophagitis = 
+              'Prior Esophagitis',
+        history_ulcerative_colitis = 
+          'Prior Ulcerative Colitis', 
+            history_angiodysplasia = 
+              'Prior Angiodysplasia',
+        history_colon_polyp = 
+          'Prior Colon Polyp'
+                 ), 
+        type = all_continuous() ~ 'continuous2',
+        statistic = 
+            list(all_continuous() ~ 
+                     c('{mean} ({sd})',
+                       '{median} ({p25}, {p75})',
+                       '{min} - {max}')
+                 )
+        ) %>% 
+  as_gt() # %>%
+  # gt::tab_header('Table 1: Demographic Characteristics') 
+
+## back up table that adds the strata of 
+## the 2 NSAIDs that result in GI bleeds
+table1a <- final_baseline_df %>% 
+    filter( nsaid_drug_type %in% c('Celecoxib', 'Diclofenac')) %>%
+    select(sex, age_at_baseline, age_cat,
+           history_peptic_ulcer, 
+           history_colon_polyp,
+           history_esophagitis,
+           history_angiodysplasia,
+           history_ulcerative_colitis, nsaid_drug_type) %>% 
+    tbl_summary(data = .,
+                by = nsaid_drug_type,
+        label = 
+            list( sex = 'Sex', 
+                  age_at_baseline ='Age', 
+                  age_cat ='Age categorized',
+                  history_peptic_ulcer = 
+          'Prior Peptic Ulcer',    
+        history_esophagitis = 
+              'Prior Esophagitis',
+        history_ulcerative_colitis = 
+          'Prior Ulcerative Colitis', 
+            history_angiodysplasia = 
+              'Prior Angiodysplasia',
+        history_colon_polyp = 
+          'Prior Colon Polyp'),
+
+        type = all_continuous() ~ 'continuous2',
+        statistic = 
+            list(all_continuous() ~ 
+                     c('{mean} ({sd})',
+                       '{median} ({p25}, {p75})',
+                       '{min} - {max}')
+            )
+    ) %>%
+    add_overall() %>% 
+  as_gt() # %>%
+  # gt::tab_header('Table 1a: Demographic Characteristics Stratified by Top NSAIDs') 
+
+## cross tabulation of conditions by larger subgroups
+## modifications to include % at patient level instead of row level
+table2 <- baseline_condition_df %>% 
+  mutate(
+    Osteoarthritis = factor(case_when(
+      condition_label == 'Osteoarthritis Only' ~
+        'O Only',
+      condition_label == 'Diverticular Disease Only' ~
+        'O + Diverticular Disease',
+      condition_label == 'Diverticular Disease & Other' ~
+        'O + Diverticular Disease + Other Conditions',
+      condition_label == 'Other Only' ~
+        'O + Other Conditions',
+    ),
+    level = c(
+      'O Only', 
+      'O + Diverticular Disease',
+      'O + Diverticular Disease + Other Conditions',
+      
+      'O + Other Conditions'
+    )
+    ),
+    condition_name = gsub('Osteoarthritis', 'Osteoarthritis (O)', condition_name),
+      condition_name = factor(condition_name,
+             levels = 
+               c('Osteoarthritis (O)', 'Diverticular disease', 
+                 sort(setdiff(unique(
+                   baseline_condition_df$condition_name), 
+                   c('Osteoarthritis (O)', 'Diverticular disease'))
+                   )
+                 ))
+  ) %>%
+  select(condition_name, Osteoarthritis) %>% 
+  tbl_summary(
+    label = list(condition_name = 'Condition'),
+    by = Osteoarthritis,
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  add_overall() %>%
+  ## updating denominator and 
+  ## formating: 0.0% to <0.1%, .0% to %, and 0 to ''
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        percent_0 = case_when(
+          !is.na(stat_0) | stat_0 != '' ~
+            paste0('(' , scales::percent(as.numeric(
+              gsub(',','',stat_0)) / 
+                n_ct %>% 
+                filter(label == 'Osteo') %>%
+                pull(n), 
+              accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_1 = case_when(
+          !is.na(stat_1) | stat_1 != '' ~
+            paste0('(' , scales::percent(as.numeric(
+              gsub(',','',stat_1)) / 
+                n_ct %>% 
+                filter(label == 'Osteoarthritis Only') %>%
+                pull(n) , 
+              accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_2 = case_when(
+          !is.na(stat_2) | stat_2 != '' ~
+            paste0('(' , scales::percent(as.numeric(
+              gsub(',','',stat_2)) / 
+                n_ct %>% 
+                filter(label == 'Diverticular Disease Only') %>%
+                pull(n) , 
+              accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_3 = case_when(
+          !is.na(stat_3) | stat_3 != '' ~
+            paste0('(' , scales::percent(as.numeric(
+              gsub(',','',stat_3)) / 
+                n_ct %>% 
+                filter(label == 'Diverticular Disease & Other') %>%
+                pull(n) , 
+              accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_4 = case_when(
+          !is.na(stat_4) | stat_4 != '' ~
+            paste0('(' , scales::percent(as.numeric(
+              gsub(',','',stat_4)) / 
+                n_ct %>% 
+                filter(label == 'Other Only') %>%
+                pull(n) , 
+              accuracy = 0.1), ')'),
+          T ~ ''),
+        across(c(percent_0, percent_1, percent_2, 
+                 percent_3, percent_4),
+               ~ case_when(
+                 . == '(0.0%)' ~ '(<0.1%)',
+                 grepl('.0%', .) ~ 
+                   gsub('\\.0', '', .),
+                 T ~ .)
+               ),
+        stat_0 = case_when(
+          is.na(stat_0) | stat_0 == '0' ~ '',
+          T ~ paste(stat_0, percent_0)
+        ),
+        stat_1 = case_when(
+          is.na(stat_1) | stat_1 == '0' ~ '',
+          T ~ paste(stat_1, percent_1)
+        ),
+        stat_2 = case_when(
+          is.na(stat_2) | stat_2 == '0' ~ '',
+          T ~ paste(stat_2, percent_2)
+        ),
+        stat_3 = case_when(
+          is.na(stat_3) | stat_3 == '0' ~ '',
+          T ~ paste(stat_3, percent_3)
+        ),
+        stat_4 = case_when(
+          is.na(stat_4) | stat_4 == '0' ~ '',
+          T ~ paste(stat_4, percent_4)
+        )
+      ) %>%
+      select(-c(percent_0, percent_1, percent_2, 
+                percent_3, percent_4))
+  ) %>%
+  remove_row_type(condition_name, type = 'header') %>%
+  ## updating header to include the correct denominator 
+  modify_header(
+    label = '**Condition**',
+    stat_0 ~ paste0('**Overall**  \nN = ',
+                    n_ct %>% 
+                filter(label == 'Osteo') %>%
+                pull(n_txt) ), 
+    stat_1 = 
+      paste0('**O Only**  \nN = ',
+             n_ct %>% 
+               filter(label == 
+                        'Osteoarthritis Only') %>%
+               pull(n_txt) ), 
+    stat_2 = 
+      paste0('**O + Diverticular Disease**  \nN = ',
+             n_ct %>% 
+               filter(label == 
+                        'Diverticular Disease Only') %>%
+               pull(n_txt) ), 
+    stat_3 = 
+      paste0('**O + Diverticular Disease + Other Conditions**  \nN = ',
+             n_ct %>% 
+               filter(label == 
+                        'Diverticular Disease & Other') %>%
+               pull(n_txt) ), 
+    stat_4 = 
+      paste0('**O + Other Conditions**  \nN = ',
+             n_ct %>% 
+               filter(label == 'Other Only') %>%
+               pull(n_txt) )
+) %>% 
+  modify_footnote(
+    everything() ~ "The count per conditon is not mutually exclusive; %s are calculated per column total",
+    stat_1 ~ NA_character_,
+    label ~ NA_character_) %>%
+  as_gt()  %>%
+  # gt::tab_header('Table 2: Distribution of Conditions')  %>%
+  gt::tab_source_note(
+      gt::md(
+        paste0("Abbrevations: Osteoarthritis (O)")
+      ))
+
+
+## backup table, count of all conditions ; at record level
+table2_overall <- baseline_condition_df %>% 
+  select(condition_name) %>% 
+  tbl_summary(
+    label = list(condition_name = 'Condition'),
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  ## updating denominator and 
+  ## formating: 0.0% to <0.1%, .0% to %, and 0 to ''
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        percent = case_when(
+          !is.na(stat_0) | stat_0 != '' ~
+                   paste0('(' , scales::percent(as.numeric(
+                     gsub(',','',stat_0)) / 
+                       nrow(final_baseline_df) , 
+                     accuracy = 0.1), ')'),
+          T ~ ''),
+        percent = case_when(
+          percent == '(0.0%)' ~ '(<0.1%)',
+          grepl('.0%', percent) ~ 
+            gsub('\\.0', '', percent),
+          T ~ percent
+        ),
+        stat_0 = case_when(
+          is.na(stat_0)  ~ '',
+          T ~ paste(stat_0, percent)
+          )
+        ) %>%
+          select(-percent)
+      ) %>%
+  remove_row_type(condition_name, type = 'header') %>%
+  modify_header(
+    label = 'Condition',
+    all_stat_cols() ~ paste0("**N = ", 
+                             scales::number(
+                               nrow(final_baseline_df), 
+                               big.mark = ','),"**")
+  ) %>%
+  modify_footnote(
+    everything() ~ NA_character_, 
+    label ~ 'The count per conditon is not mutually exclusive') %>%
+  as_gt() # %>%
+  # gt::tab_header('Table 2A: Distribution of Conditions') 
+
+## cross tabulation of dugs by larger drug subgroups
+## modifications to include % at patient level instead of record
+table3 <- baseline_drugs_ai %>%
+  select(overall_drug_name, overall_drug_type) %>%
+  mutate(
+    overall_drug_name = 
+        factor(overall_drug_name %>% stringr::str_to_title(),
+               levels = 
+                 c('Celecoxib', 'Diclofenac',
+                   'Naproxen', 'Ibuprofen',
+                   sort(setdiff(unique(
+                   baseline_drugs_ai$overall_drug_name) %>%
+                     stringr::str_to_title(), 
+                   c('Celecoxib', 'Diclofenac',
+                   'Naproxen', 'Ibuprofen'))
+                   ))) ,
+    overall_drug_type = factor(overall_drug_type,
+                               levels = 
+                                 c('NSAID', 'Immunosuppresant', 'Other'))
+    ) %>%
+  tbl_summary(by = overall_drug_type,
+              statistic = all_categorical() ~ '{n}') %>%
+  add_overall() %>%
+  ## updating denominator and 
+  ## formating: 0.0% to <0.1%, .0% to %, and 0 to ''
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        percent_0 = case_when(
+          !is.na(stat_0) | stat_0 != '' ~
+                   paste0('(' , scales::percent(as.numeric(
+                     gsub(',','',stat_0)) / 
+                       n_drug_ct %>%
+                       filter(label == 'NSAID') %>%
+                       pull(n), 
+                     accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_1 = case_when(
+          !is.na(stat_1) | stat_1 != '' ~
+                   paste0('(' , scales::percent(as.numeric(
+                     gsub(',','',stat_1)) / 
+                       n_drug_ct %>%
+                       filter(label == 'NSAID') %>%
+                       pull(n), 
+                     accuracy = 0.1), ')'),
+          T ~ ''),
+        percent_2 = case_when(
+          !is.na(stat_2) | stat_2 != '' ~
+                   paste0('(' , scales::percent(as.numeric(
+                     gsub(',','',stat_2)) / 
+                       n_drug_ct %>%
+                       filter(label == 
+                                'Immunosuppresant') %>%
+                       pull(n), 
+                     accuracy = 0.1), ')'),
+          T ~ ''),
+         percent_3 = case_when(
+          !is.na(stat_3) | stat_3 != '' ~
+                   paste0('(' , scales::percent(as.numeric(
+                     gsub(',','',stat_3)) / 
+                       n_drug_ct %>%
+                       filter(label == 
+                                'Other') %>%
+                       pull(n), 
+                     accuracy = 0.1), ')'),
+          T ~ ''),
+        across(c(percent_0, percent_1, 
+                 percent_2, percent_3),
+               ~ case_when(
+                 . == '(0.0%)' ~ '(<0.1%)',
+                 grepl('.0%', .) ~ 
+                   gsub('\\.0', '', .),
+                 T ~ .)
+               ),
+        stat_0 = case_when(
+          is.na(stat_0) | stat_0 == '0' ~ '',
+          T ~ paste(stat_0, percent_0)
+          ),
+        stat_1 = case_when(
+          is.na(stat_1) | stat_1 == '0' ~ '',
+          T ~ paste(stat_1, percent_1)
+          ),
+         stat_2 = case_when(
+          is.na(stat_2) | stat_2 == '0' ~ '',
+          T ~ paste(stat_2, percent_2)
+          ),
+        stat_3 = case_when(
+          is.na(stat_3) | stat_3 == '0' ~ '',
+          T ~ paste(stat_3, percent_3)
+          )
+        ) %>%
+          select(-c(percent_1, percent_2, percent_3))
+      ) %>%
+  remove_row_type(overall_drug_name, type = 'header') %>%
+  ## updating header to include the correct denominator 
+  modify_header(
+    label = '**Drug**',
+    stat_0 ~ paste0('**Overall**  \nN = ',
+                    n_drug_ct %>%
+                       filter(label == 'NSAID') %>%
+                       pull(n_txt) ), 
+    stat_1 ~ paste0('**NSAID**  \nN = ',
+                    n_drug_ct %>%
+                       filter(label == 'NSAID') %>%
+                       pull(n_txt) ), 
+    stat_2 = 
+      paste0('**Immunosuppresant**  \nN = ',
+             n_drug_ct %>%
+               filter(label == 'Immunosuppresant') %>%
+               pull(n_txt)), 
+    stat_3 = 
+      paste0('**Other**  \nN = ',
+             n_drug_ct %>%
+               filter(label == 'Other') %>%
+               pull(n_txt)  )
+  ) %>%
+  modify_footnote(
+    everything() ~ 'The count per drug is not mutually exclusive',
+   label ~  NA_character_
+    ) %>%
+  as_gt() #  %>%
+  # gt::tab_header('Table 3: Distribution of Drugs') 
+
+## cross tabulation of condition subgroup by nsaid combinations
+table4 <- final_baseline_df %>% 
+    select(Osteoarthritis, 
+           nsaid_drug_type) %>% 
+    tbl_cross(
+        label = 
+            list(Osteoarthritis = 
+                   'Osteoarthritis (O)', 
+                 nsaid_drug_type = 
+                   'NSAID Combination')
+        )  %>%
+    as_gt() %>%
+    gt::tab_source_note(
+      gt::md(
+        paste0("The breakdown of 'other conditions' can be found in Table 2")
+      )) # %>%
+  # gt::tab_header('Table 4: NSAID Combinations by Condition') 
+
+
+## as table 5 requires a lot of modifications
+## to get desired table, it is located in the next code chunk
+
+## combine the GI bleed for 14 days and 30days into one table
+## result shown by condition subgroup
+## data is at patient level,
+## %s are # per subgroup w. GI bleed/total number w. GI bleed
+## add in incidence
+table6ab <- tbl_merge(
+  tbls = list(
+  final_baseline_df %>% 
+    filter(gi_bleed_14day == T) %>%
+    select(Osteoarthritis) %>%
+    tbl_summary() %>%
+    modify_header(label = 'Osteoarthritis (O)') %>%
+    remove_row_type(Osteoarthritis, type = 'header') ,
+  final_baseline_df %>% 
+    filter(gi_bleed_30day == T) %>%
+    select(Osteoarthritis) %>%
+    tbl_summary() %>%
+    modify_header(label = 'Osteoarthritis (O)') %>%
+    remove_row_type(Osteoarthritis, type = 'header') 
+  ),
+   tab_spanner = c('**\U2264 14 days**', '**\U2264 30 days**')
+) %>% 
+  modify_header(stat_0_1 ~ '**\U2264 14 days**', 
+                stat_0_2 ~ '**\U2264 30 days**')%>%
+  modify_footnote(
+    label ~ "Bleed is within '(X)' days of NSAID index",
+    stat_0_1 ~ '% derived from column total',
+    stat_0_2 ~ '% derived from column total'
+    )
+
+## incidence for 14 days
+t6a <-final_baseline_df %>% 
+  filter(gi_bleed_14day == T) %>%
+  select(Osteoarthritis) %>%
+  tbl_summary(
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        percent = case_when(
+          label == 'O Only' ~ 
+            as.numeric(stat_0[label == 'O Only'])/ 
+            n_ct %>% 
+            filter(label == 'Osteoarthritis Only') %>% 
+            pull(n),
+          label == 'O + Diverticular Disease' ~ 
+            as.numeric(stat_0[label == 'O + Diverticular Disease'])/ 
+            n_ct %>% 
+            filter(label == 'Diverticular Disease Only') %>% 
+            pull(n),
+          label == 'O + Diverticular Disease + Other Conditions' ~ 
+            as.numeric(stat_0[label == 'O + Diverticular Disease + Other Conditions'])/ 
+            n_ct %>% 
+            filter(label == 'Diverticular Disease & Other') %>% 
+            pull(n),
+          label == 'O + Other Conditions' ~ 
+            as.numeric(stat_0[label == 'O + Other Conditions'])/ 
+            n_ct %>% 
+            filter(label == 'Other Only') %>% 
+            pull(n),
+          T ~ NA_real_),
+          
+        percent = case_when(
+          is.na(percent) ~ NA_character_,
+          T ~ scales::percent(as.numeric(percent), 
+                              accuracy = 0.1)
+        ),
+        percent = case_when(
+          percent == '(0.0%)' ~ '(<0.1%)',
+          grepl('.0%', percent) ~ 
+            gsub('\\.0', '', percent),
+          T ~ percent
+        ),
+        stat_0 = case_when(
+          is.na(stat_0)  ~ '',
+          T ~ paste(percent)
+        )
+      ) %>%
+      select(-c(percent))
+  ) %>%
+modify_header(stat_0 ~ '**\U2264 14 days**', 
+              label = 'Osteoarthritis (O)') %>%
+  modify_footnote(everything() ~ NA_character_)  %>%
+  remove_row_type(Osteoarthritis, type = 'header')
+
+## incidence for 30 days
+t6b <- final_baseline_df %>% 
+  filter(gi_bleed_30day == T) %>%
+  select(Osteoarthritis) %>%
+  tbl_summary(
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        percent = case_when(
+          label == 'O Only' ~ 
+            as.numeric(stat_0[label == 'O Only'])/ 
+            n_ct %>% 
+            filter(label == 'Osteoarthritis Only') %>% 
+            pull(n),
+          label == 'O + Diverticular Disease' ~ 
+            as.numeric(stat_0[label == 'O + Diverticular Disease'])/ 
+            n_ct %>% 
+            filter(label == 'Diverticular Disease Only') %>% 
+            pull(n),
+          label == 'O + Diverticular Disease + Other Conditions' ~ 
+            as.numeric(stat_0[label == 'O + Diverticular Disease + Other Conditions'])/ 
+            n_ct %>% 
+            filter(label == 'Diverticular Disease & Other') %>% 
+            pull(n),
+          label == 'O + Other Conditions' ~ 
+            as.numeric(stat_0[label == 'O + Other Conditions'])/ 
+            n_ct %>% 
+            filter(label == 'Other Only') %>% 
+            pull(n),
+          T ~ NA_real_),
+        
+        percent = case_when(
+          is.na(percent) ~ NA_character_,
+          T ~ scales::percent(as.numeric(percent), accuracy = 0.1)
+        ),
+        percent = case_when(
+          percent == '(0.0%)' ~ '(<0.1%)',
+          grepl('.0%', percent) ~ 
+            gsub('\\.0', '', percent),
+          T ~ percent
+        ),
+        stat_0 = case_when(
+          is.na(stat_0)  ~ '',
+          T ~ paste(percent)
+        )
+      ) %>%
+      select(-c(percent))
+  ) %>%
+  modify_header(stat_0 ~ '**\U2264 30 days**',
+                label = 'Osteoarthritis (O)') %>%
+  modify_footnote(everything() ~ NA_character_) %>%
+  remove_row_type(Osteoarthritis, type = 'header')
+
+table6 <- tbl_merge(
+  tbls = list(table6ab , 
+              t6a, t6b),
+  tab_spanner = c('Observed', 'Incidence', 'Incidence')
+) %>%
+  # modify_footnote(everything() ~ NA_character_) %>% 
+  as_gt() %>%
+  gt::tab_source_note(
+    gt::md(
+      paste0("The breakdown of 'other conditions' can be found in Table 2")
+    ))   
+
+## cross tabulated table between condition subgroup and NSAID to
+## combine the GI bleed for 14 days and 30days into one table
+## result shown by condition subgroup
+## data is at patient level,
+## %s are # per subgroup w. GI bleed/total number w. GI bleed
+table7 <- tbl_stack(
+  tbls = list(final_baseline_df %>% 
+    filter(gi_bleed_14day == T) %>%
+    select(Osteoarthritis, 
+           nsaid_drug_type) %>%
+    tbl_cross(
+        label = 
+            list(Osteoarthritis = 
+                     'Osteoarthritis (O) Subgroup', 
+                 nsaid_drug_type = 
+                     'NSAID Drug')
+    )%>%
+    remove_row_type(Osteoarthritis, type = 'header') ,
+    final_baseline_df %>% 
+    filter(gi_bleed_30day == T) %>%
+    select(Osteoarthritis, 
+           nsaid_drug_type
+           ) %>%
+    tbl_cross(
+        label = 
+            list(Osteoarthritis = 
+                     '', 
+                 nsaid_drug_type = 
+                     'NSAID Drug')
+    ) %>%
+    remove_row_type(Osteoarthritis, type = 'header') 
+  ),
+   group_header = c('GI Bleed within 14 days of Index', 
+                    'GI Bleed within 30 days of Index')
+) %>%
+  modify_footnote(
+    label ~ "Abbreviations: Gastrointestinal Bleed (GI), Osteoarthritis (O)"
+    ) %>%
+    as_gt() %>%
+ # gt::tab_header('Table 7: Gastrointestinal Bleed by Condition and Drug') %>%
+  gt::tab_source_note(
+      gt::md(
+        paste0("The breakdown of 'other conditions' can be found in Table 2")
+      )) 
+
+
+## no history of any top prior condition has 
+## a higher count for bleed than having a history of a 
+## top prior condition
+## the #s with a top prior condition 
+## are too small to get a comparison of GI bleeds
+
+## frequency of GI bleed by nsaid drug, 
+## per top prior condition history
+gi_bleed_history <- final_baseline_df %>% 
+  group_by(gi_bleed_30day, nsaid_drug_type) %>% 
+  count(history_peptic_ulcer, history_colon_polyp,
+        history_ulcerative_colitis, history_esophagitis,
+        history_angiodysplasia) %>% 
+  ungroup() %>% 
+  filter(gi_bleed_30day == T) 
+
+
+```
+
+```{r incidence}
+#| echo: false
+
+## observed values for gi bleed (14,30) by nsaid drug
+## data is at patient level,
+## observed %s are # per subgroup w. GI bleed/
+##              total number w. GI bleed
+## incidence % is # of patients with GI bleed /
+##                  total number w NSAID drug
+## incidence overall is # of patients with GI bleed/
+##                  total number of patients in cohort
+
+
+## to create table 5
+## observed data: (1 & 2 are stacked) 
+## 1. observed data: one table per gi bleed (14[t5a],30[t5c]) 
+## 2. incidence data: one table per gi bleed (14[t5b], 30[t5d])
+## 3. overall observed & incidence: one table per gi bleed (14[t5ab], 30[t5cd])
+## tables in 1 & 2 are merged (14[t5a + t5b], 30 [t5c + t5d])
+## then tables these ables are stacked to the overall tables
+
+t5a <- final_baseline_df %>% 
+  filter(gi_bleed_14day == T) %>%
+  select(nsaid_drug_type) %>%
+  tbl_summary(
+    label = list(nsaid_drug_type = 'NSAID Drug')
+  ) %>%
+  modify_footnote(
+    stat_0 ~ '% of total with GI Bleed'
+  ) %>%
+  remove_row_type(nsaid_drug_type, type = 'header')
+
+
+t5b <- final_baseline_df %>% 
+  filter(gi_bleed_14day == T) %>%
+  select(nsaid_drug_type) %>%
+  tbl_summary(
+    label = list(nsaid_drug_type = 'NSAID Drug'),
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        ndem = c(NA_real_,
+                 final_baseline_df %>% 
+                   count(nsaid_drug_type) %>% 
+                   filter(nsaid_drug_type %in% 
+                            c('Celecoxib', 
+                              'Diclofenac')
+                   ) %>% 
+                   pull(n)),
+        percent = case_when(
+          !is.na(stat_0) | stat_0 != '' ~
+            paste0( scales::percent(as.numeric(
+              gsub(',','',stat_0)) / ndem , 
+              accuracy = 0.1)),
+          T ~ ''),
+        percent = case_when(
+          percent == '(0.0%)' ~ '(<0.1%)',
+          grepl('.0%', percent) ~ 
+            gsub('\\.0', '', percent),
+          T ~ percent
+        ),
+        stat_0 = case_when(
+          is.na(stat_0)  ~ '',
+          T ~ paste(percent)
+        )
+      ) %>%
+      select(-c(percent,ndem))
+  ) %>%
+  modify_header(
+    stat_0 ~ paste0('**',
+                    scales::percent(49/n_drug_ct %>%
+                                      filter(label == 'NSAID') %>%
+                                      pull(n), accuracy = .1), '**' ), 
+  ) %>%
+  remove_row_type(nsaid_drug_type, type = 'header') %>%
+  modify_footnote(
+    stat_0 ~ '% of total'
+  )
+
+
+t5ab <- tbl_merge(
+  tbls = list(final_baseline_df %>% 
+                filter(gi_bleed_14day == T) %>%
+                select(gi_bleed_14day) %>%
+                tbl_summary(
+                  label = list(gi_bleed_14day = 'Overall'),
+                  statistic = list(all_categorical() ~ '{n}')
+                )  %>%
+                modify_footnote(
+                  everything() ~ NA_character_
+                ),
+              final_baseline_df %>% 
+                filter(gi_bleed_14day == T) %>%
+                select(gi_bleed_14day) %>%
+                tbl_summary(
+                  label = list(gi_bleed_14day = 'Overall'),
+                  statistic = list(all_categorical() ~ '{n}')
+                )  %>%
+                modify_footnote(
+                  everything() ~ NA_character_
+                ) %>%
+                modify_table_body(
+                  ~ .x %>%
+                    mutate(
+                      percent = case_when(
+                        !is.na(stat_0) | stat_0 != '' ~
+                          paste0( scales::percent(as.numeric(
+                            gsub(',','',stat_0)) / 
+                              n_ct %>% 
+                              filter(label == 'Osteo') %>% 
+                              pull(n), 
+                            accuracy = 0.1)),
+                        T ~ ''),
+                      percent = case_when(
+                        percent == '(0.0%)' ~ '(<0.1%)',
+                        grepl('.0%', percent) ~ 
+                          gsub('\\.0', '', percent),
+                        T ~ percent
+                      ),
+                      stat_0 = case_when(
+                        is.na(stat_0)  ~ '',
+                        T ~ paste(percent)
+                      )
+                    ) %>%
+                    select(-c(percent))
+                ) 
+  ),
+  tab_spanner = c('**Observed**', '**Incidence**')
+) %>%
+  modify_header(
+    stat_0_1 ~ '', 
+    stat_0_2 ~ '', 
+    label ~ ''
+  )
+
+
+t5c <- final_baseline_df %>% 
+  filter(gi_bleed_30day == T) %>%
+  select(nsaid_drug_type) %>%
+  tbl_summary(
+    label = list(nsaid_drug_type = 'NSAID Drug')
+  ) %>%
+  modify_footnote(
+    stat_0 ~ '% of total with GI Bleed'
+  ) %>%
+  remove_row_type(nsaid_drug_type, type = 'header')
+
+
+t5d <- final_baseline_df %>% 
+  filter(gi_bleed_30day == T) %>%
+  select(nsaid_drug_type) %>%
+  tbl_summary(
+    label = list(nsaid_drug_type = 'NSAID Drug'),
+    statistic = list(all_categorical() ~ '{n}')
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        ndem = c(NA_real_,
+                 final_baseline_df %>% 
+                   count(nsaid_drug_type) %>% 
+                   filter(nsaid_drug_type %in% 
+                            c('Celecoxib', 
+                              'Diclofenac')
+                   ) %>% 
+                   pull(n)),
+        percent = case_when(
+          !is.na(stat_0) | stat_0 != '' ~
+            paste0(scales::percent(as.numeric(
+              gsub(',','',stat_0)) / ndem , 
+              accuracy = 0.1)),
+          T ~ ''),
+        percent = case_when(
+          percent == '(0.0%)' ~ '(<0.1%)',
+          grepl('.0%', percent) ~ 
+            gsub('\\.0', '', percent),
+          T ~ percent
+        ),
+        stat_0 = case_when(
+          is.na(stat_0)  ~ '',
+          T ~ paste(percent)
+        )
+      ) %>%
+      select(-c(percent,ndem))
+  ) %>%
+  modify_header(
+    stat_0 ~ paste0('**',
+                    scales::percent(159/n_drug_ct %>%
+                                      filter(label == 'NSAID') %>%
+                                      pull(n), accuracy = .1), '**' ), 
+  ) %>%
+  remove_row_type(nsaid_drug_type, type = 'header')  %>%
+  modify_footnote(
+    stat_0 ~ '% of total with GI Bleed'
+  ) 
+
+
+t5cd <- tbl_merge(
+  tbls = list(final_baseline_df %>% 
+                filter(gi_bleed_30day == T) %>%
+                select(gi_bleed_30day) %>%
+                tbl_summary(
+                  label = list(gi_bleed_30day = 'Overall'),
+                  statistic = list(all_categorical() ~ '{n}')
+                )  %>%
+                modify_footnote(
+                  everything() ~ NA_character_
+                ),
+              final_baseline_df %>% 
+                filter(gi_bleed_30day == T) %>%
+                select(gi_bleed_30day) %>%
+                tbl_summary(
+                  label = list(gi_bleed_30day = 'Overall'),
+                  statistic = list(all_categorical() ~ '{n}')
+                )  %>%
+                modify_footnote(
+                  everything() ~ NA_character_
+                ) %>%
+                modify_table_body(
+                  ~ .x %>%
+                    mutate(
+                      percent = case_when(
+                        !is.na(stat_0) | stat_0 != '' ~
+                          paste0( scales::percent(as.numeric(
+                            gsub(',','',stat_0)) / 
+                              n_ct %>% 
+                              filter(label == 'Osteo') %>% 
+                              pull(n), 
+                            accuracy = 0.1)),
+                        T ~ ''),
+                      percent = case_when(
+                        percent == '(0.0%)' ~ '(<0.1%)',
+                        grepl('.0%', percent) ~ 
+                          gsub('\\.0', '', percent),
+                        T ~ percent
+                      ),
+                      stat_0 = case_when(
+                        is.na(stat_0)  ~ '',
+                        T ~ paste(percent)
+                      )
+                    ) %>%
+                    select(-c(percent))
+                ) 
+  ),
+  tab_spanner = c('**Observed**', '**Incidence**')
+) %>%
+  modify_header(
+    stat_0_1 ~ '', 
+    stat_0_2 ~ '', 
+    label ~ '',
+  )
+
+table5 <- tbl_stack(tbls = list(
+  tbl_stack(tbls = 
+              list(t5ab,
+                   tbl_merge(tbls = list(t5a, t5b),
+                             tab_spanner = c('**Observed**', '**Incidence**')
+                   )
+              ),
+            group_header = rep('Within 14 days of Index', 2),
+            quiet = T
+  ),
+  
+  tbl_stack(tbls = 
+              list(t5cd,
+                   tbl_merge(tbls = list(t5c, t5d),
+                             tab_spanner = c('**Observed**', '**Incidence**')
+                   )
+              ),
+            group_header = rep('Within 30 days of Index', 2),
+            quiet = T
+  ) 
+  
+),
+group_header = c('GI Bleed within 14 Days of Index',
+                 'GI Bleed within 30 Days of Index'),
+            quiet = T
+) %>% bold_labels() %>%
+  modify_footnote(
+    stat_0_1 ~ 'N (%) of total with GI Bleed',
+    stat_0_2 ~ '% of total'
+  )  %>%
+    gtsummary::as_gt() %>%
+  gt::tab_style(
+    style = gt::cell_text(weight = 'bold'),
+    locations = gt::cells_row_groups(groups = everything())
+  ) # %>%
+  # gt::tab_header('Table 5: Incidence of Gastrointestinal Bleed by Drug') 
+
+
+```
+
+```{r plot}
+#| code-summary: "Click to view the code for plot"
+
+## restrict to population with gi bleed
+## compute the difference in time from cohort start to gi bleed
+time_df <- final_baseline_df %>%
+  filter(!is.na(gi_bleed_start_date)) %>%
+  select(subject_id, 
+         cohort_start_date,
+         gi_bleed_start_date,
+         nsaid_drug_type) %>%
+  rename(NSAID = nsaid_drug_type) %>%
+  mutate(
+    event_time = as.numeric(gi_bleed_start_date - cohort_start_date)
+         ) 
+
+n_nsaid_ct <- final_baseline_df %>%
+  count(nsaid_drug_type) %>%
+  filter(nsaid_drug_type %in% c(
+    'Celecoxib', 'Diclofenac'
+  ))
+
+## plot the time between by NSAID drug
+## add the count and median (iqr) per NSAID to the plot
+plot_nsaid_time <- time_df %>% 
+  group_by(NSAID) %>%
+  count(event_time) %>% 
+  ungroup() %>%
+  mutate(
+    inc = case_when(
+      NSAID == 'Celecoxib' ~ 
+        n/(n_nsaid_ct %>% 
+             filter(grepl('Cele', nsaid_drug_type)) %>% 
+             pull(n)),
+      NSAID != 'Celecoxib' ~ 
+        n/(n_nsaid_ct %>% 
+             filter(grepl('Dicl', nsaid_drug_type)) %>% 
+             pull(n))
+    ),
+    inc = round(inc * 100,3)
+    ) %>%
+  ggplot2::ggplot(ggplot2::aes(x = factor(event_time), 
+             y = inc,
+             fill = NSAID)) +
+  ggplot2::geom_col(   position = 'dodge',
+    alpha = 0.65,
+    width = 0.5) +
+  ggplot2::scale_fill_brewer(palette = 'Set1') +
+  ggplot2::labs(title = '', 
+       x = 'Time difference in days',
+       y = 'Incidence in %',
+       caption = 
+         paste('Median (IQR)\n',
+               time_df %>% 
+                 group_by(NSAID) %>% 
+                 summarize(summary_stat(event_time)) %>%
+                 mutate(note = paste0(NSAID, ': ',
+                                     median_iqr)) %>% 
+                 pull(note) %>%
+                 paste(., collapse = '\n')
+               )
+  ) +
+  ggplot2::theme_bw() + 
+  ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 90, hjust = 1, vjust = 0)) 
+
+```
+
+# Demographics
+
+```{r print_table1}
+#| label: tbl-table1
+#| tbl-cap: 'Demographic Characteristics'
+#| echo: false
+
+table1
+```
+
+The NSAID cohort consists of `{r} n_ct %>% filter(label == "Osteo") %>% pull(n_txt)` patients, with a slightly higher proportion of females (51%) compared to males (49%). The average age at the time of NSAID exposure is 39 years, with nearly half (48%) of the patients aged between 35 and 39. At least 30% of the population has a history of prior chronic conditions, among these conditions, peptic ulcer history is particularly notable as it affects 30% of the NSAID cohort. These numbers are detailed above in @tbl-table1.
+
+# Conditions at Index
+
+```{r print_table2}
+#| label: tbl-table2
+#| tbl-cap: 'Distribution of Conditions'
+#| echo: false
+
+table2
+```
+
+@tbl-table2 presents a comprehensive overview of various conditions within the NSAID cohort reported at the time of NSAID exposure (index) or captured within the index date. Osteoarthritis was found to be present in the entire NSAID population and diverticular disease was present in 15% of the population. To provide a better understanding of the conditions present around the time of NSAID exposure, subgroups were created based on osteoarthritis and other high-frequency conditions, which include both chronic and acute conditions. Four key subgroups were identified: patients with osteoarthritis only ("O Only"), those with both osteoarthritis and diverticular disease ("O + Diverticular Disease"), individuals with osteoarthritis, diverticular disease, and at least one acute condition ("O + Diverticular Disease + Other Conditions"), and patients with osteoarthritis and other conditions but without diverticular disease ("O + Other Conditions").
+
+# Drug Use at Index
+
+```{r print_table3}
+#| label: tbl-table3
+#| tbl-cap: 'Distribution of Drugs'
+#| echo: false
+
+table3
+```
+
+In the NSAID cohort, drug usage was identified at or around the time of NSAID exposure. Four known NSAID drugs were found to be used by patients in the cohort: celecoxib, diclofenac, naproxen, and ibuprofen. The majority of NSAID use was concentrated between two drugs: celecoxib, accounting for 68% of usage, and diclofenac, used by 32% of the cohort; the other two NSAID drugs account for \<1% drug usage in the cohort. The data showed use of immunosuppressants in a very small proportion of the cohort (combined \<0.1%); these immunosuppressants included cyclosporine, hydrocortisone, and methotrexate. For classification purposes, any medication that was neither a known NSAID nor an immunosuppressant was categorized as "Other" (combined \<2%).
+
+## Intersection of Conditions and Drug Use
+
+As NSAIDs are of primary interest, the discussion will focus on the use of any NSAID drug. Given that the entire NSAID cohort has osteoarthritis, it is worthwhile to examine the distribution of NSAID usage across each osteoarthritis subgroup; this distribution can be seen in the table below. In the osteoarthritis (O) only subgroup, there are approximately twice as many users of celecoxib compared to diclofenac. In the O + Diverticular Disease subgroup, the use of celecoxib is more than five times that of diclofenac. The use of any other drug combinations among the remaining two subgroups (O + Diverticular Disease + Other Conditions and O + Other Conditions) is not notable, as their drug use accounts for less than 3% of the population.
+
+```{r print_table4}
+#| label: tbl-table4
+#| tbl-cap: 'NSAID Combinations by Condition'
+#| echo: false
+
+table4
+```
+
+# Outcome
+
+```{r print_table5}
+#| label: tbl-table5
+#| tbl-cap: 'Incidence of Gastrointestinal Bleed by Drug'
+#| echo: false
+
+table5
+```
+
+Since NSAID medications can cause ulcers and bleeding in the stomach and intestines, a common outcome to examine is gastrointestinal (GI) bleeding. In this study, GI bleeding was measured within 30 days of NSAID exposure. Among the NSAID drugs observed in the cohort, only celecoxib and diclofenac were associated with GI bleeding outcomes. Notably, subgroups of patients taking combinations such as celecoxib & ibuprofen, celecoxib & naproxen, and diclofenac & naproxen did not experience GI bleeding. GI bleeds were limited to patients who took either celecoxib or diclofenac alone.
+
+Within 14 days, there were 49 patients who experienced a GI bleed, with 65% of these patients having taken celecoxib. Within 30 days, the number of patients with a GI bleed increased to 159, with 71% of them having taken celecoxib. Despite the higher proportion of patients using celecoxib, the incidence of GI bleeding within 14 days was similar between patients taking celecoxib (1.7%) and those taking diclofenac (2%). However, the incidence of GI bleeding within 30 days was slightly higher in patients taking celecoxib (6.1%) compared to those taking diclofenac (5.4%). The results can be seen above in @tbl-table5.
+
+Among those with a GI bleed, the Osteoarthritis (O) only subgroup had the highest proportion of patients experiencing this outcome. However, within 14 days of NSAID exposure, the incidence of GI bleeds was higher in the Osteoarthritis + Diverticular Disease + Other Conditions subgroup. Within 30 days, the incidence of GI bleeds remained consistent in this group but increased across all other subgroups. Notably, in the Osteoarthritis only and Osteoarthritis + Diverticular Disease groups, the incidence of GI bleeds more than doubled. Despite these increases, the incidence of GI bleeds was still lower in the Osteoarthritis only group compared to the other subgroups. Results can be seen in the table below.
+
+```{r print_table6}
+#| label: tbl-table6
+#| tbl-cap: 'Gastrointestinal Bleed by Condition'
+#| echo: false
+
+table6
+```
+
+Additionally, the graph below illustrates that the time to GI bleed from the index date varies between the two drugs. Up to 11 days post-index, the incidence of GI bleeds is higher among those taking diclofenac. However, from day 12 onward, the incidence of GI bleeds is generally higher in patients taking celecoxib. There are two notable exceptions: on day 27, the incidence for diclofenac reaches its highest point of the entire 30-day period, surpassing all other incidences regardless of drug; and on day 24, the incidence for diclofenac is not only higher than celecoxib but also matches its levels from the early part of the 30-day period. Despite the variations observed in the graph, the overall incidence of GI bleeds between the two drug cohorts remains fairly similar, as shown in @tbl-table5.
+
+```{r print_plot}
+#| label: fig-plot1
+#| fig-cap: 'Time between Index and Gastrointestinal Bleed'
+#| echo: false
+
+plot_nsaid_time
+```
+
+### Reference
+
+OpenAI. (2024). *ChatGPT* (Aug 2 version) \[Large language model\]. <https://chat.openai.com/chat>
